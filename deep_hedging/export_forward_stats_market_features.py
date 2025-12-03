@@ -8,7 +8,7 @@ import h5py
 import numpy as np
 import tensorflow as tf
 
-from model import model_hedge_strat, policy_probe  # adjust import if needed
+from model_2 import model_hedge_strat, policy_probe  # adjust import if needed
 
 
 def assert_exists(p: Path, label: str):

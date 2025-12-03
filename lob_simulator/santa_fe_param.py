@@ -127,4 +127,4 @@ _params = _load_santa_fe_csv(STOCK)
 globals().update(_params)
 
 # Shared simulation / training discretization (can be changed if needed)
-time_window = 1.0   # hours
+time_window = 1.0 / 60.0   # hours

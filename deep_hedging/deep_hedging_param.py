@@ -11,16 +11,16 @@ from lob_simulator.santa_fe_param import L
 
 
 # --- Neural Network Architecture ---
-N           = 32 # Trading Nodes
+N           = 16 # Trading Nodes
 num_layers  = 2   # Depth
 num_neurons = 16  # Width
 num_outputs = L+1 # Outputs per time step (phi, theta)
 
 # --- Training Parameters ---
 epochs                  = 1000  # Number of epochs
-batch_size              = 10000 # Number of batches per epoch
+batch_size              = 2500 # Number of batches per epoch
 #optimizer              = Adam
-learning_rate           = 1e-1
+learning_rate           = 1e-0
 early_stopping_patience = 10
 lr_schedule_factor      = 0.5
 lr_schedule_patience    = 5

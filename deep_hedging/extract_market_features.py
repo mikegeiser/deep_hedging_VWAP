@@ -1,281 +1,332 @@
 # extract_market_features.py
 
-import os
 import argparse
+import gc
+from time import time
 from pathlib import Path
+import sys
 
-import h5py
 import numpy as np
-import tensorflow as tf
+import h5py
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
-from model import model_hedge_strat, policy_probe  # adjust import if needed
+# Make sure repo root is on sys.path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-
-def assert_exists(p: Path, label: str):
-    if not p.exists():
-        parent = p.parent
-        msg = [f"{label} not found: {p}"]
-        if parent.exists():
-            try:
-                entries = "\n  - " + "\n  - ".join(sorted(e.name for e in parent.iterdir()))
-                msg.append(f"\nContents of {parent}:\n{entries}")
-            except Exception:
-                pass
-        else:
-            msg.append(f"\nParent directory does not exist: {parent}")
-        raise FileNotFoundError("\n".join(msg))
+from deep_hedging_param import N
+from lob_simulator.santa_fe_param import _load_santa_fe_csv, time_window, L
+from lob_simulator.lob import apply_event_nb
+from lob_simulator.util_lob import depleted_liquidity, bid_ladder, ask_ladder
 
 
-def load_snapshots(mkt_h5: Path):
+def reconstruct_one_path(events, params):
     """
-    Load 'snapshots' from <STOCK>_market_features.h5 and basic attrs.
+    Reconstruct LOB state from a sequence of events and extract features
+    on a regular time grid.
+
+    Parameters
+    ----------
+    events : np.ndarray, shape (N_events,), structured dtype with fields
+        'dt'   : float16
+        'size' : float16
+        'type' : int8
+        'rel'  : int16 (or int8 for older files)
+    params : dict
+        Output of _load_santa_fe_csv(stock), containing:
+        K, S_0, varepsilon_0, a_0_vec, b_0_vec, c_infty, tick, time_window, ...
 
     Returns
     -------
-    snaps : np.ndarray, shape (num_paths, N+1, D)
-    meta  : dict with keys N, D, L, num_paths, num_snaps
+    out : np.ndarray, shape (N+1, D), dtype float32
+        Per-time-step market features:
+          0      : mid price S_t
+          1      : spread ε_t
+          2..    : a_0..a_{L-1}
+          ...    : b_0..b_{L-1}
+          ...    : e_0..e_{L-1} (fill ratios)
+          last-1 : vol (traded volume in (t_n, t_{n+1}])
+          last   : val (trade value in (t_n, t_{n+1}])
     """
-    with h5py.File(str(mkt_h5), "r") as f:
+    K = int(params["K"])
+    S = float(params["S_0"])
+    varepsilon = float(params["varepsilon_0"])
+    a_vec = params["a_0_vec"].astype(np.float64).copy()
+    b_vec = params["b_0_vec"].astype(np.float64).copy()
+    c_infty = params["c_infty"]
+    tick = params["tick"]
+
+    # Global time horizon
+    T = 60 * 60 * time_window
+
+    # Feature dimension: first L queues for ask/bid + L e's + 2 (S, ε) + 2 (vol, val)
+    D = 3 * L + 4
+
+    # Output array (float32)
+    out = np.empty((N + 1, D), dtype=np.float32)
+
+    def best_prices(S_val, varepsilon_val):
+        ask_price = S_val + 0.5 * varepsilon_val
+        bid_price = S_val - 0.5 * varepsilon_val
+        return ask_price, bid_price
+
+    # Initial snapshot at t = 0
+    ask_price, bid_price = best_prices(S, varepsilon)
+    out[0, 0] = S
+    out[0, 1] = varepsilon
+    out[0, 2: 2 + L] = a_vec[:L]
+    out[0, 2 + L: 2 + 2 * L] = b_vec[:L]
+    out[0, 2 + 2 * L: 2 + 3 * L] = 0.0  # e's
+    out[0, 2 + 3 * L] = 0.0             # vol
+    out[0, 2 + 3 * L + 1] = 0.0         # val
+
+    # Time grid
+    t_grid = np.linspace(0.0, T, N + 1)
+
+    # Absolute event times
+    if events.shape[0] > 0:
+        dt = events["dt"].astype(np.float32)
+        t_events = np.cumsum(dt)
+    else:
+        dt = np.zeros(0, dtype=np.float32)
+        t_events = np.zeros(0, dtype=np.float32)
+    n_events = events.shape[0]
+
+    idx = 0  # pointer into events
+
+    for n in range(N):
+        t_start = t_grid[n]
+        t_end = t_grid[n + 1]
+
+        vol = 0.0
+        val = 0.0
+        min_bid_hit = np.inf
+        min_ask_seen = np.inf
+
+        # Precompute initial absolute bid prices & ticks for this step
+        ask_price_step_start, _ = best_prices(S, varepsilon)
+        initial_abs_bid_prices = bid_ladder(ask_price_step_start, tick, K)  # shape (K,)
+        init_ticks = np.rint(initial_abs_bid_prices / tick).astype(np.int64)
+
+        # Process events in (t_start, t_end]
+        while idx < n_events and t_events[idx] <= t_end:
+            et = int(events[idx]["type"])
+            qty = float(events[idx]["size"])
+            rel = int(events[idx]["rel"])
+
+            # Best prices before event
+            ask_price_curr, bid_price_curr = best_prices(S, varepsilon)
+
+            if et == 0:  # Sell MO hits the bid
+                vol += qty
+                exctn_prcs = bid_ladder(ask_price_curr, tick, b_vec.shape[0])
+                exctn_qntts = depleted_liquidity(b_vec, qty)
+                val += float(np.dot(exctn_prcs, exctn_qntts))
+
+                mask = exctn_qntts > 0
+                if np.any(mask):
+                    hit_px = exctn_prcs[mask][-1]
+                    if hit_px < min_bid_hit:
+                        min_bid_hit = hit_px
+
+            elif et == 1:  # Buy MO lifts the ask
+                vol += qty
+                exctn_prcs = ask_ladder(bid_price_curr, tick, a_vec.shape[0])
+                exctn_qntts = depleted_liquidity(a_vec, qty)
+                val += float(np.dot(exctn_prcs, exctn_qntts))
+
+            # Update LOB state
+            S, varepsilon, a_vec, b_vec = apply_event_nb(
+                (float(dt[idx]), et, qty, rel),
+                S, varepsilon, a_vec, b_vec,
+                tick, c_infty
+            )
+
+            # Track min best ask seen during the step
+            ask_price_after, _ = best_prices(S, varepsilon)
+            if ask_price_after < min_ask_seen:
+                min_ask_seen = ask_price_after
+
+            idx += 1
+
+        # Compute fill ratios (for K levels, then slice to L)
+        reference_price = min(min_bid_hit, min_ask_seen)
+        if np.isfinite(reference_price):
+            ref_ticks = int(np.rint(reference_price / tick))
+            e_full = (
+                (init_ticks > ref_ticks).astype(np.float32) * 1.0 +
+                (init_ticks == ref_ticks).astype(np.float32) * 0.5
+            ).astype(np.float32)
+        else:
+            e_full = np.zeros(K, dtype=np.float32)
+
+        # Snapshot at end of step n -> row n+1
+        ask_price, bid_price = best_prices(S, varepsilon)
+        row = n + 1
+        out[row, 0] = S
+        out[row, 1] = varepsilon
+        out[row, 2: 2 + L] = a_vec[:L]
+        out[row, 2 + L: 2 + 2 * L] = b_vec[:L]
+        out[row, 2 + 2 * L: 2 + 3 * L] = e_full[:L]
+        out[row, 2 + 3 * L] = vol
+        out[row, 2 + 3 * L + 1] = val
+
+        # If no more events, fill remaining rows with constant state and zero flows
+        if idx >= n_events:
+            for m in range(n + 1, N):
+                row2 = m + 1
+                out[row2, 0] = S
+                out[row2, 1] = varepsilon
+                out[row2, 2: 2 + L] = a_vec[:L]
+                out[row2, 2 + L: 2 + 2 * L] = b_vec[:L]
+                out[row2, 2 + 2 * L: 2 + 3 * L] = 0.0
+                out[row2, 2 + 3 * L] = 0.0
+                out[row2, 2 + 3 * L + 1] = 0.0
+            break
+
+    return out
+
+
+def reconstruct_one_path_from_file(path_index, events_path_str, params):
+    """
+    Worker helper: open the HDF5 events file, load one path by index,
+    and run reconstruct_one_path(events, params).
+    """
+    with h5py.File(events_path_str, "r") as fev:
+        events_ds = fev["events"]
+        events = events_ds[path_index]  # 1D array (N_events,) with structured dtype
+    return reconstruct_one_path(events, params)
+
+
+def save_snapshots_h5(file_path, path_data_list, N_val, D_val):
+    """
+    Append a batch of snapshot paths (each shape: (N+1, D)) to an H5 file.
+    Stored as float32 to avoid overflow in trade value.
+    """
+    path_data_array = np.stack(path_data_list, axis=0).astype(np.float32)  # (batch_size, N+1, D)
+
+    with h5py.File(file_path, "a") as f:
         if "snapshots" not in f:
-            raise KeyError(f"'snapshots' dataset not found in {mkt_h5}. Available: {list(f.keys())}")
-        snaps = f["snapshots"][:]  # (num_paths, N+1, D)
-        num_paths, num_snaps, D = snaps.shape
-
-        N_attr = int(f.attrs.get("N", num_snaps - 1))
-        D_attr = int(f.attrs.get("D", D))
-        L = int(f.attrs.get("L", 0))
-
-        if D_attr != D:
-            raise ValueError(f"D mismatch in attrs vs data: D_attr={D_attr}, D_data={D}")
-        if num_snaps != N_attr + 1:
-            raise ValueError(f"Time dimension mismatch: num_snaps={num_snaps}, but attrs say N={N_attr} (expect N+1).")
-        if L <= 0:
-            raise ValueError(f"Bad L attribute in {mkt_h5}: L={L}")
-
-    meta = dict(N=N_attr, D=D, L=L, num_paths=num_paths, num_snaps=num_snaps)
-    return snaps, meta
+            ds = f.create_dataset(
+                "snapshots",
+                data=path_data_array,
+                maxshape=(None, N_val + 1, D_val),
+                dtype="float32",
+                compression="lzf",
+            )
+            ds.attrs["N"] = N_val
+            ds.attrs["D"] = D_val
+            ds.attrs["L"] = L
+        else:
+            ds = f["snapshots"]
+            current_paths = ds.shape[0]
+            new_paths = current_paths + path_data_array.shape[0]
+            ds.resize((new_paths, N_val + 1, D_val))
+            ds[current_paths:] = path_data_array
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description=(
-            "Run a single forward pass of the trained model on ALL training data "
-            "and export summary stats to a single HDF5 file, using *_market_features.*:\n"
-            "  - terminal wealth per trajectory\n"
-            "  - average delta per time step\n"
-            "  - terminal delta per trajectory\n"
-            "  - average phi per time step\n"
-            "  - average theta per level per time step"
-        )
+    parser = argparse.ArgumentParser(
+        description="Extract regular-grid market features from simulated events."
     )
-    # --stock / --symbol / -s all map to the same thing
-    ap.add_argument(
-        "--stock", "--symbol", "-s",
-        dest="stock",
-        required=True,
-        help="Stock symbol, e.g. TSLA, CSCO, INTC, PCLN.",
+    parser.add_argument("--stock", type=str, required=True, help="Stock symbol, e.g. TSLA, CSCO, INTC, PCLN.")
+    parser.add_argument(
+        "--events-path",
+        type=str,
+        default=None,
+        help="HDF5 file with event sequences (output of simulate_events.py). "
+             "If not provided, defaults to ../data/<STOCK>/<STOCK>_events.h5",
     )
-    ap.add_argument(
-        "--market-h5",
-        default="",
-        help=(
-            "Path to <STOCK>_market_features.h5. "
-            "Default: <project_root>/data/<STOCK>/<STOCK>_market_features.h5"
-        ),
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=None,
+        help="HDF5 file to write market features to. "
+             "If not provided, defaults to ../data/<STOCK>/<STOCK>_market_features.h5",
     )
-    ap.add_argument(
-        "--weights",
-        default="",
-        help=(
-            "Path to weights .h5. "
-            "Default: <project_root>/data/<STOCK>/<STOCK>_market_features_best.weights.h5"
-        ),
-    )
-    ap.add_argument(
-        "--out-h5",
-        default="",
-        help=(
-            "Output HDF5 path. "
-            "Default: <project_root>/data/<STOCK>/<STOCK>_market_features_forward_stats.h5"
-        ),
-    )
-    ap.add_argument(
-        "--batch-size",
-        type=int,
-        default=1024,
-        help="Batch size for model.predict (default: 1024).",
-    )
-    args = ap.parse_args()
+    parser.add_argument("--n-jobs", type=int, default=1, help="Parallel workers for each chunk.")
+    parser.add_argument("--chunk-size", type=int, default=100, help="How many paths per chunk to process & save.")
+    args = parser.parse_args()
 
-    stock = args.stock.strip().upper()
+    stock = args.stock.upper()
 
-    # project_root = parent of the folder containing this script
-    # if script is C:\deep_hedging_VWAP\deep_hedging\..., then project_root = C:\deep_hedging_VWAP
-    project_root = Path(__file__).resolve().parents[1]
-    data_dir = project_root / "data" / stock
+    # Load params for this stock (for K, initial state, etc.)
+    params = _load_santa_fe_csv(stock)
+    K = int(params["K"])
+    D = 3 * L + 4
 
-    # Default paths under <project_root>/data/<STOCK>/
-    market_h5 = Path(args.market_h5) if args.market_h5 else (
-        data_dir / f"{stock}_market_features.h5"
-    )
-    weights_path = Path(args.weights) if args.weights else (
-        data_dir / f"{stock}_market_features_best.weights.h5"
-    )
-    out_h5 = Path(args.out_h5) if args.out_h5 else (
-        data_dir / f"{stock}_market_features_forward_stats.h5"
-    )
-    out_h5.parent.mkdir(parents=True, exist_ok=True)
+    # Determine events path
+    if args.events_path is None:
+        here = Path(__file__).resolve().parent  # deep_hedging/
+        repo_root = here.parent
+        events_path = repo_root / "data" / stock / f"{stock}_events.h5"
+    else:
+        events_path = Path(args.events_path)
 
-    print(f"\n📁 Project root auto-detected as: {project_root}")
-    print(f"📂 Data directory for {stock}: {data_dir}")
+    # Determine save path
+    if args.save_path is None:
+        here = Path(__file__).resolve().parent
+        repo_root = here.parent
+        save_path = repo_root / "data" / stock / f"{stock}_market_features.h5"
+    else:
+        save_path = Path(args.save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("\n🔁 Checking input paths...")
-    assert_exists(market_h5, "Market features H5 file")
-    assert_exists(weights_path, "Weights file")
+    if not events_path.exists():
+        raise FileNotFoundError(f"Events file not found: {events_path}")
 
-    print(f"\n📦 Loading snapshots from: {market_h5}")
-    snaps, meta = load_snapshots(market_h5)
-    num_paths = meta["num_paths"]
-    num_snaps = meta["num_snaps"]  # should be N+1
-    D_file = meta["D"]
-    N_attr = meta["N"]
-    L_attr = meta["L"]
+    # How many paths in events file?
+    with h5py.File(events_path, "r") as fev:
+        if "events" not in fev:
+            raise KeyError(f"No 'events' dataset found in {events_path}")
+        n_paths_total = fev["events"].shape[0]
 
-    print(f"  snapshots shape: {snaps.shape} (paths, snaps, D)")
-    print(f"  N={N_attr}, D={D_file}, L={L_attr}")
-
-    # Check model vs data feature width
-    F_model = int(model_hedge_strat.inputs[0].shape[-1])
-    if F_model != D_file:
-        raise ValueError(f"Model expects feature dim={F_model} but data has D={D_file}.")
-
-    print(f"\n🔁 Loading weights from: {weights_path}")
-    model_hedge_strat.load_weights(str(weights_path))
-
-    # Build model inputs for all time steps: list length = num_snaps (N+1)
-    print("\n🧱 Building x_eval (full dataset for all time steps)...")
-    x_eval = [snaps[:, t, :].astype(np.float32) for t in range(num_snaps)]
-
-    # Collect delta_acc_* outputs from the main model
-    print("\n🔍 Collecting delta_acc_* outputs from model...")
-    delta_outputs = []
-    n = 0
-    while True:
-        layer_name = f"delta_acc_{n}"
-        try:
-            layer = model_hedge_strat.get_layer(layer_name)
-        except ValueError:
-            break
-        delta_outputs.append(layer.output)
-        n += 1
-
-    if not delta_outputs:
-        raise RuntimeError("No 'delta_acc_*' layers found in model_hedge_strat.")
-
-    num_delta_steps = len(delta_outputs)
-    print(f"  Found {num_delta_steps} delta_acc_* layers.")
-
-    # policy_probe gives [phi_0,...,phi_{N-1}, theta_0,...,theta_{N-1}]
-    print("\n🧠 Preparing combined probe model (wealth + deltas + policy outputs) ...")
-    combined_outputs = [model_hedge_strat.output] + delta_outputs + list(policy_probe.outputs)
-
-    combined_probe = tf.keras.Model(
-        inputs=model_hedge_strat.inputs,
-        outputs=combined_outputs,
-        name="forward_stats_probe"
+    print(
+        f"[~] Stock: {stock} | Source: {events_path} | Target market features: {save_path}\n"
+        f"    N_paths = {n_paths_total}, N = {N}, K = {K}, L = {L}, D = {D}"
     )
 
-    # Single forward pass
-    print("\n🚀 Running single forward pass over ALL trajectories...")
-    all_outs = combined_probe.predict(x_eval, batch_size=args.batch_size, verbose=1)
+    t0 = time()
+    remaining = n_paths_total
+    processed = 0
+    chunk_idx = 0
 
-    # Unpack outputs
-    wealth_out = all_outs[0]  # terminal wealth, shape (num_paths, 1) or (num_paths,)
-    wealth_out = np.asarray(wealth_out).reshape(num_paths)
+    while remaining > 0:
+        chunk_idx += 1
+        batch = min(args.chunk_size, remaining)
+        start_idx = processed
+        end_idx = processed + batch
 
-    delta_list = all_outs[1:1 + num_delta_steps]  # each (num_paths, 1)
-    policy_outs = all_outs[1 + num_delta_steps:]  # [phi_0..phi_{N-1}, theta_0..theta_{N-1}]
+        desc = f"Chunk {chunk_idx} (paths {start_idx}..{end_idx-1})"
 
-    # Deltas: stack into (num_paths, num_delta_steps)
-    delta_mat = np.column_stack([np.asarray(d).reshape(num_paths) for d in delta_list])
-
-    # 1) Terminal wealth per trajectory
-    terminal_wealth = wealth_out  # shape (num_paths,)
-
-    # 2) Average delta per time step over trajectories
-    avg_delta_per_step = delta_mat.mean(axis=0)  # shape (num_delta_steps,)
-
-    # 3) Terminal delta per trajectory
-    terminal_delta = delta_mat[:, -1]  # shape (num_paths,)
-
-    # 4) Average allocations for φ (MOs) and θ (LO vector) per time step
-    num_policy_outs = len(policy_outs)
-    # With snapshots of length N+1, we expect N policy steps for phi/theta
-    n_phi = num_snaps - 1
-    if num_policy_outs < 2 * n_phi:
-        raise RuntimeError(
-            f"Expected at least {2 * n_phi} policy outputs (phi+theta) but got {num_policy_outs}."
+        # Reconstruct in parallel by index; each worker opens the HDF5 file
+        results = Parallel(
+            n_jobs=args.n_jobs,
+            backend="loky",
+            prefer="processes",
+            pre_dispatch="n_jobs",
+            batch_size=1,
+        )(
+            delayed(reconstruct_one_path_from_file)(i, str(events_path), params)
+            for i in tqdm(range(start_idx, end_idx), desc=desc)
         )
 
-    phi_outs = policy_outs[:n_phi]
-    theta_outs = policy_outs[n_phi: n_phi + n_phi]
+        save_snapshots_h5(str(save_path), results, N, D)
+        del results
+        gc.collect()
 
-    # Infer L_out from a theta sample
-    theta_sample = np.asarray(theta_outs[0])
-    if theta_sample.ndim != 2:
-        raise RuntimeError(f"Unexpected theta output shape: {theta_sample.shape}")
-    L_out = theta_sample.shape[1]
+        processed += batch
+        remaining -= batch
 
-    # avg_phi_per_step: (n_phi,)
-    avg_phi_per_step = np.array(
-        [np.asarray(phi_t).reshape(num_paths).mean() for phi_t in phi_outs],
-        dtype=np.float64,
-    )
+        with h5py.File(save_path, "r") as fsnap:
+            total_saved = fsnap["snapshots"].shape[0]
+        print(f"✓ Saved chunk {chunk_idx}: {batch} paths (total in file: {total_saved})")
 
-    # avg_theta_per_step: (n_phi, L_out)
-    avg_theta_per_step = np.zeros((n_phi, L_out), dtype=np.float64)
-    for t, theta_t in enumerate(theta_outs):
-        arr = np.asarray(theta_t)  # (num_paths, L_out)
-        avg_theta_per_step[t, :] = arr.mean(axis=0)
-
-    # ---------- Save everything to a single HDF5 file ----------
-    print(f"\n💾 Saving forward stats to: {out_h5}")
-    with h5py.File(str(out_h5), "w") as f:
-        # Attributes for context
-        f.attrs["stock"] = stock
-        f.attrs["num_paths"] = num_paths
-        f.attrs["num_snaps"] = num_snaps
-        f.attrs["D"] = D_file
-        f.attrs["N"] = N_attr
-        f.attrs["L_market_features"] = L_attr
-        f.attrs["num_delta_steps"] = num_delta_steps
-        f.attrs["n_phi_steps"] = n_phi
-        f.attrs["L_out"] = L_out
-
-        # 1) terminal wealth per trajectory
-        f.create_dataset("terminal_wealth", data=terminal_wealth, compression="lzf")
-
-        # 2) average delta per time step
-        f.create_dataset("avg_delta_per_step", data=avg_delta_per_step, compression="lzf")
-
-        # 3) terminal delta per trajectory
-        f.create_dataset("terminal_delta", data=terminal_delta, compression="lzf")
-
-        # 4a) average φ per time step (market order allocation)
-        f.create_dataset("avg_phi_per_step", data=avg_phi_per_step, compression="lzf")
-
-        # 4b) average θ per level per time step
-        for k in range(L_out):
-            ds_name = f"avg_theta_level_{k + 1}_per_step"
-            f.create_dataset(ds_name, data=avg_theta_per_step[:, k], compression="lzf")
-
-        # Optional: full matrix
-        f.create_dataset("avg_theta_per_step", data=avg_theta_per_step, compression="lzf")
-
-    print("✅ Done. All requested stats stored in a single HDF5 file.")
+    print(f"✅ Done. Wrote market features for {processed} paths to {save_path}")
+    print(f"⏱️ Elapsed: {round(time() - t0, 2)} seconds")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-    tf.get_logger().setLevel("ERROR")
     main()

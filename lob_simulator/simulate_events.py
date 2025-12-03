@@ -18,10 +18,10 @@ from lob import apply_event_nb
 
 # Structured dtype for a single event:
 EVENT_DTYPE = np.dtype([
-    ("dt",   "<f2"),  # float16 for time increments (OK, values are small)
+    ("dt",   "<f2"),  # float16 for time increments
     ("size", "<f4"),  # float32 for size to avoid overflow to inf
     ("type", "i1"),   # int8
-    ("rel",  "i1"),   # int8
+    ("rel",  "<i2"),  # int16
 ])
 
 
@@ -107,12 +107,10 @@ def simulate_one_path_events(params):
 
     out = np.empty(len(events_py), dtype=EVENT_DTYPE)
     for i, (dt, size, et, rp) in enumerate(events_py):
-        # dt stays float16 to save space; typical dt values are small, no overflow risk
-        out[i]["dt"]   = np.float16(dt)
-        # size is stored as float32 to avoid float16 overflow to inf
-        out[i]["size"] = np.float32(size)
+        out[i]["dt"]   = np.float16(dt) # dt stays float16 to save space; typical dt values are small, no overflow risk
+        out[i]["size"] = np.float32(size) # size is stored as float32 to avoid float16 overflow to inf
         out[i]["type"] = np.int8(et)
-        out[i]["rel"]  = np.int8(rp)
+        out[i]["rel"]  = np.int16(rp)
 
     return out
 
