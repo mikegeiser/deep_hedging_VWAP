@@ -149,7 +149,7 @@ python extract_market_features.py --stock <STOCK> --n-jobs 20 --chunk-size 1000
 ```
 4. Train agent
 ```
-python train_agent_2.py --stock TSLA --accum-steps 5
+python train_agent_2.py --stock <STOCK> --accum-steps 5
 ```
 5. Export forward stats
 ```
