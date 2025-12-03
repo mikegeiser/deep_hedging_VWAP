@@ -1,4 +1,4 @@
-# Deep Hedging the Volume-Weighted Average Price in Order-Driven Markets
+# Deep Hedging the Volume-Weighted Average Price Risk in Order-Driven Markets
 
 This repository implements a full VWAP risk deep-hedging pipeline ...
 It includes:
