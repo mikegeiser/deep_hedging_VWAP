@@ -1,7 +1,6 @@
 # Deep Hedging the Volume-Weighted Average Price Risk in Order-Driven Markets
 
-This repository implements a full VWAP risk deep-hedging pipeline ...
-It includes:
+This repository implements a full VWAP risk deep-hedging pipeline. It includes:
 - Event simulation using a parametric model (Santa Fe LOB) calibrated on real LOBSTER data 
 - Market feature extraction from simulated event sequences
 - Deep Hedging modelling and training
